@@ -1,0 +1,76 @@
+#!/bin/sh
+
+die () { echo "$@" ; exit 1; }
+
+: nvm.sh
+\. ../../../nvm.sh
+
+\. ../../common.sh
+
+# A bare version is still just a node version. No npm pin.
+try nvm_nvmrc_npm_version "22.14.0"
+[ "${CAPTURED_EXIT_CODE}" = "0" ] || die "bare version: expected exit 0, got ${CAPTURED_EXIT_CODE}"
+[ -z "${CAPTURED_STDOUT}" ] || die "bare version: expected no npm pin, got '${CAPTURED_STDOUT}'"
+
+# The node line stays the node line when an exact pin is present.
+try nvm_process_nvmrc_content "22.14.0
+npm=11.10.0"
+[ "${CAPTURED_EXIT_CODE}" = "0" ] || die "process with pin: expected exit 0, got ${CAPTURED_EXIT_CODE}"
+[ "${CAPTURED_STDOUT}" = "22.14.0" ] || die "process with pin: expected node 22.14.0, got '${CAPTURED_STDOUT}'"
+
+try nvm_nvmrc_npm_version "22.14.0
+npm=11.10.0"
+[ "${CAPTURED_EXIT_CODE}" = "0" ] || die "exact pin: expected exit 0, got ${CAPTURED_EXIT_CODE}"
+[ "${CAPTURED_STDOUT}" = "11.10.0" ] || die "exact pin: expected 11.10.0, got '${CAPTURED_STDOUT}'"
+
+# Spaces, a leading pin, and comments are already legal .nvmrc syntax.
+try nvm_nvmrc_npm_version "npm = 11.10.0
+22.14.0 # shipped npm
+# npm=1.2.3"
+[ "${CAPTURED_EXIT_CODE}" = "0" ] || die "trimmed pin: expected exit 0, got ${CAPTURED_EXIT_CODE}"
+[ "${CAPTURED_STDOUT}" = "11.10.0" ] || die "trimmed pin: expected 11.10.0, got '${CAPTURED_STDOUT}'"
+
+# Other reserved keys stay ignored.
+try nvm_nvmrc_npm_version "22.14.0
+volta=ignored"
+[ "${CAPTURED_EXIT_CODE}" = "0" ] || die "other key: expected exit 0, got ${CAPTURED_EXIT_CODE}"
+[ -z "${CAPTURED_STDOUT}" ] || die "other key: expected no npm pin, got '${CAPTURED_STDOUT}'"
+
+# The same shapes Node accepts: major, minor, patch, and an optional v.
+try nvm_nvmrc_npm_version "22.14.0
+npm=11"
+[ "${CAPTURED_EXIT_CODE}" = "0" ] || die "major pin: expected exit 0, got ${CAPTURED_EXIT_CODE}"
+[ "${CAPTURED_STDOUT}" = "11" ] || die "major pin: expected 11, got '${CAPTURED_STDOUT}'"
+
+try nvm_nvmrc_npm_version "22.14.0
+npm=11.10"
+[ "${CAPTURED_EXIT_CODE}" = "0" ] || die "minor pin: expected exit 0, got ${CAPTURED_EXIT_CODE}"
+[ "${CAPTURED_STDOUT}" = "11.10" ] || die "minor pin: expected 11.10, got '${CAPTURED_STDOUT}'"
+
+try nvm_nvmrc_npm_version "22.14.0
+npm=v11.10.0"
+[ "${CAPTURED_EXIT_CODE}" = "0" ] || die "v-prefixed pin: expected exit 0, got ${CAPTURED_EXIT_CODE}"
+[ "${CAPTURED_STDOUT}" = "v11.10.0" ] || die "v-prefixed pin: expected v11.10.0, got '${CAPTURED_STDOUT}'"
+
+try nvm_nvmrc_npm_version "22.14.0
+npm=11."
+[ "${CAPTURED_EXIT_CODE}" = "0" ] || die "trailing-dot pin: expected exit 0, got ${CAPTURED_EXIT_CODE}"
+[ "${CAPTURED_STDOUT}" = "11." ] || die "trailing-dot pin: expected 11., got '${CAPTURED_STDOUT}'"
+
+# Aliases and non-versions stay rejected. Those are Node concepts, not npm versions.
+try_err nvm_nvmrc_npm_version "22.14.0
+npm=latest"
+[ "${CAPTURED_EXIT_CODE}" != "0" ] || die "latest pin: expected failure"
+
+try_err nvm_nvmrc_npm_version "22.14.0
+npm=node"
+[ "${CAPTURED_EXIT_CODE}" != "0" ] || die "node alias pin: expected failure"
+
+try_err nvm_nvmrc_npm_version "22.14.0
+npm=iojs-1"
+[ "${CAPTURED_EXIT_CODE}" != "0" ] || die "iojs pin: expected failure"
+
+try_err nvm_nvmrc_npm_version "22.14.0
+npm=11.10.0
+npm=11.10.1"
+[ "${CAPTURED_EXIT_CODE}" != "0" ] || die "duplicate pin: expected failure"

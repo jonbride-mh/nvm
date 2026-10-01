@@ -46,6 +46,7 @@
     - [Pass Authorization header to mirror](#pass-authorization-header-to-mirror)
   - [Platforms without official binaries](#platforms-without-official-binaries)
   - [.nvmrc](#nvmrc)
+    - [Pinning npm](#pinning-npm)
   - [Deeper Shell Integration](#deeper-shell-integration)
     - [Calling `nvm use` automatically in a directory with a `.nvmrc` file](#calling-nvm-use-automatically-in-a-directory-with-a-nvmrc-file)
       - [bash](#bash)
@@ -734,7 +735,30 @@ Now using node v5.9.1 (npm v3.7.3)
 
 The contents of a `.nvmrc` file **must** contain precisely one `<version>` (as described by `nvm --help`) followed by a newline. `.nvmrc` files may also have comments. The comment delimiter is `#`, and it and any text after it, as well as blank lines, and leading and trailing white space, will be ignored when parsing.
 
-Key/value pairs using `=` are also allowed and ignored, but are reserved for future use, and may cause validation errors in the future.
+Key/value pairs using `=` are allowed. `npm=<version>` pins an npm release, described below. Any other key is ignored, reserved for future use, and may cause validation errors in the future.
+
+#### Pinning npm
+
+An `.nvmrc` can name the Node version and, on another line, an npm version:
+
+```text
+22.14.0
+npm=11.10.0
+```
+
+`npm=11` and `npm=11.10` are also valid, as is an optional `v` prefix. Matching follows the same rules as a Node version: `11` is the highest installed 11.x, `11.10` is the highest installed 11.10.x, and `11.1` does not match 11.10. An exact `major.minor.patch` is that version. Implicit aliases such as `node` or `lts/*` are not accepted here.
+
+`nvm use` and `nvm install` resolve the Node version as before. With no `npm` line, `PATH` contains only that Node's `bin`, so the npm that shipped in the tarball is the one that runs. With an `npm` line, nvm installs that npm once, using the shipped npm, into `$NVM_DIR/versions/npm/<version>` (always an exact version). It prepends that directory's `bin`, which comes before the Node `bin`, so both `npm` and `npx` are the pinned ones. That includes Corepack shims that live in the Node `bin`. The same install is shared by every Node version that pins it. `nvm ls` and `nvm current` do not treat it as a Node version, and uninstalling a Node version does not delete it.
+
+A partial spec uses an installed copy when one matches, and does not ask the registry. When nothing installed matches, the shipped npm resolves it (`npm view npm@11 version`) and nvm installs that exact result. `nvm use` and `nvm install` leave that line as written, so `npm=11` keeps selecting the highest installed 11. `nvm use --save` and `nvm install --save` record the exact version just activated, the same way they record the Node version, and they do that only after the engines check has passed. A refused pin leaves `.nvmrc` unchanged. The recorded npm version has no `v` prefix.
+
+`nvm install --latest-npm` and `nvm install-latest-npm` refuse to run while a pinned npm is active, because that upgrade would rewrite the shared copy. Change the `npm=` line instead.
+
+While the pin is active, nvm exports `NPM_CONFIG_PREFIX` to that directory. `npm install -g` then writes into the shared npm directory, not into the Node tarball. `nvm deactivate`, and `nvm use` of a Node version that this `.nvmrc` does not name, unset that variable. An `NPM_CONFIG_PREFIX` or `PREFIX` you set yourself, pointing outside `$NVM_DIR`, is still rejected.
+
+Before changing `PATH`, nvm reads the pinned npm's `engines.node` and refuses to switch when the selected Node does not satisfy it.
+
+This applies only in a shell that has run `nvm use` or `nvm install`. A process that never did so still sees whatever `npm` is already on `PATH`.
 
 Run [`npx nvmrc`](https://npmjs.com/nvmrc) to validate an `.nvmrc` file. If that tool’s results do not agree with nvm, one or the other has a bug - please file an issue.
 
@@ -983,6 +1007,8 @@ Environment Variables:
 $NPM_CONFIG_PREFIX
 $PREFIX
 ```
+
+`nvm use` does set `NPM_CONFIG_PREFIX` itself when an `.nvmrc` pins npm. That value points at `$NVM_DIR/versions/npm/<version>`, which nvm put on `PATH`. A prefix outside `$NVM_DIR` is still incompatible.
 
 Shell settings:
 

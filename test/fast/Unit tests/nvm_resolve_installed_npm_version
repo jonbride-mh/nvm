@@ -1,0 +1,52 @@
+#!/bin/sh
+
+die () { echo "$@" ; cleanup ; exit 1; }
+
+NVM_DIR="$(mktemp -d)"
+export NVM_DIR
+unset NVM_CD_FLAGS
+
+cleanup () {
+  if [ -n "${NVM_DIR-}" ]; then
+    rm -rf "${NVM_DIR}"
+  fi
+}
+
+: nvm.sh
+\. ../../../nvm.sh
+
+mkdir -p \
+  "${NVM_DIR}/versions/npm/10.9.0" \
+  "${NVM_DIR}/versions/npm/11.2.0" \
+  "${NVM_DIR}/versions/npm/11.10.0" \
+  "${NVM_DIR}/versions/npm/11.10.2"
+
+# Major: the highest 11, not 11.2 and not 10.9.
+RESOLVED="$(nvm_resolve_installed_npm_version 11)" || die 'major resolve failed'
+[ "${RESOLVED}" = '11.10.2' ] || die "major: expected 11.10.2, got '${RESOLVED}'"
+
+# Minor stops at the minor boundary, the same way Node's `24.1` does not match 24.10.
+RESOLVED="$(nvm_resolve_installed_npm_version 11.10)" || die 'minor resolve failed'
+[ "${RESOLVED}" = '11.10.2' ] || die "minor: expected 11.10.2, got '${RESOLVED}'"
+
+RESOLVED="$(nvm_resolve_installed_npm_version 11.2)" || die '11.2 resolve failed'
+[ "${RESOLVED}" = '11.2.0' ] || die "11.2: expected 11.2.0, got '${RESOLVED}'"
+
+if nvm_resolve_installed_npm_version 11.1 >/dev/null 2>&1; then
+  die '11.1 should not match 11.10'
+fi
+
+# An exact version is itself, even when that copy is not installed yet.
+RESOLVED="$(nvm_resolve_installed_npm_version 12.0.0)" || die 'exact missing resolve failed'
+[ "${RESOLVED}" = '12.0.0' ] || die "exact: expected 12.0.0, got '${RESOLVED}'"
+
+# Optional v, same as Node.
+RESOLVED="$(nvm_resolve_installed_npm_version v11)" || die 'v-prefix resolve failed'
+[ "${RESOLVED}" = '11.10.2' ] || die "v11: expected 11.10.2, got '${RESOLVED}'"
+
+# Nothing installed for this major: the caller has to ask the registry.
+if nvm_resolve_installed_npm_version 9 >/dev/null 2>&1; then
+  die '9 should not resolve when no 9.x is installed'
+fi
+
+cleanup

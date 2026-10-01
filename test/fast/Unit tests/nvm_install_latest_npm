@@ -54,3 +54,31 @@ try_err nvm_install_latest_npm
 
 EXPECTED="Unable to obtain npm version."
 [ "${CAPTURED_STDERR}" = "${EXPECTED}" ] || die "When node is system and npm is unavailable, expected >${EXPECTED}<; got >${CAPTURED_STDERR}"
+
+# A pin puts its directory in NPM_CONFIG_PREFIX. Upgrading must not rewrite that shared copy.
+PIN_ROOT="$(mktemp -d)"
+NVM_DIR="${PIN_ROOT}"
+NPM_CONFIG_PREFIX="${NVM_DIR}/versions/npm/11.10.0"
+export NVM_DIR NPM_CONFIG_PREFIX
+mkdir -p "${NPM_CONFIG_PREFIX}"
+node() {
+  echo 'v22.14.0'
+}
+nvm_ls_current() {
+  echo 'v22.14.0'
+}
+npm() {
+  if [ "$1" = "install" ]; then
+    echo upgraded > "${PIN_ROOT}/upgraded"
+  fi
+  echo '11.10.0'
+}
+try_err nvm_install_latest_npm
+case "${CAPTURED_STDERR}" in
+  *'pinned npm'*) ;;
+  *) die "pinned npm should be refused, got >${CAPTURED_STDERR}<" ;;
+esac
+[ "${CAPTURED_EXIT_CODE}" -ne 0 ] || die 'pinned npm upgrade should fail'
+[ ! -e "${PIN_ROOT}/upgraded" ] || die 'pinned npm was upgraded'
+unset NPM_CONFIG_PREFIX
+rm -rf "${PIN_ROOT}"

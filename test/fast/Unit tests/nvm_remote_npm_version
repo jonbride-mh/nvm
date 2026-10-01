@@ -1,0 +1,60 @@
+#!/bin/sh
+
+die () { echo "$@" ; cleanup ; exit 1; }
+
+NVM_DIR="$(mktemp -d)"
+export NVM_DIR
+unset NVM_CD_FLAGS
+
+cleanup () {
+  if [ -n "${NVM_DIR-}" ]; then
+    rm -rf "${NVM_DIR}"
+  fi
+}
+
+: nvm.sh
+\. ../../../nvm.sh
+
+NODE_DIR="${NVM_DIR}/versions/node/v22.14.0"
+mkdir -p "${NODE_DIR}/bin"
+
+# view npm@11 version → a quoted exact version, after a warning line.
+# view npm@9 version → a major only, which is not a pin target.
+cat > "${NODE_DIR}/bin/npm" <<'EOF'
+#!/bin/sh
+if [ "$1" != "view" ] || [ "$3" != "version" ]; then
+  echo "unexpected npm args: $*" >&2
+  exit 1
+fi
+case "$2" in
+  npm@11)
+    echo 'npm notice ignore this'
+    echo "'11.10.2'"
+    ;;
+  npm@9)
+    echo '9'
+    ;;
+  *)
+    echo "unexpected spec: $2" >&2
+    exit 1
+    ;;
+esac
+EOF
+chmod +x "${NODE_DIR}/bin/npm"
+
+RESOLVED="$(nvm_remote_npm_version 11 "${NODE_DIR}")" || die 'major remote resolve failed'
+[ "${RESOLVED}" = '11.10.2' ] || die "major: expected 11.10.2, got '${RESOLVED}'"
+
+RESOLVED="$(nvm_remote_npm_version v11 "${NODE_DIR}")" || die 'v-prefix remote resolve failed'
+[ "${RESOLVED}" = '11.10.2' ] || die "v11: expected 11.10.2, got '${RESOLVED}'"
+
+if nvm_remote_npm_version 9 "${NODE_DIR}" >/dev/null 2>&1; then
+  die 'a non-exact registry answer should fail'
+fi
+
+rm -f "${NODE_DIR}/bin/npm"
+if nvm_remote_npm_version 11 "${NODE_DIR}" >/dev/null 2>&1; then
+  die 'missing shipped npm should fail'
+fi
+
+cleanup

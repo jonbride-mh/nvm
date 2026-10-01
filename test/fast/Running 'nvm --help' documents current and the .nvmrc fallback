@@ -42,3 +42,9 @@ case "${HELP}" in
   *'Display the active node version (resolved via $PATH; not affected by .nvmrc).'*) ;;
   *) die "nvm --help did not document that 'nvm current' resolves via \$PATH" ;;
 esac
+
+# An npm pin is part of the .nvmrc contract.
+case "${HELP}" in
+  *'npm=<version>'*) ;;
+  *) die "nvm --help did not document the npm= pin" ;;
+esac

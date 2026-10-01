@@ -1,0 +1,406 @@
+#!/bin/sh
+
+die () { echo "$@" ; cleanup ; exit 1; }
+
+# Isolate from the caller's nvm. Set before sourcing so nvm.sh does not
+# reuse an inherited NVM_DIR.
+NVM_DIR="$(mktemp -d)"
+export NVM_DIR
+unset NPM_CONFIG_PREFIX PREFIX npm_config_prefix
+
+# The test suite puts npm's `which` (a node program) ahead of the system
+# one. `nvm current` uses `command which`, which then prints the program's
+# output instead of its path.
+SYSTEM_WHICH="$(PATH="$(printf '%s\n' "${PATH}" | tr ':' '\n' | grep -v 'node_modules/.bin' | tr '\n' ':')" command -v which)"
+mkdir -p "${NVM_DIR}/which-bin"
+ln -s "${SYSTEM_WHICH}" "${NVM_DIR}/which-bin/which"
+PATH="${NVM_DIR}/which-bin:${PATH}"
+export PATH
+
+cleanup () {
+  if command -v nvm >/dev/null 2>&1; then
+    nvm deactivate >/dev/null 2>&1 || true
+  fi
+  unset NPM_CONFIG_PREFIX
+  rm -f .nvmrc
+  if [ -n "${NVM_DIR-}" ]; then
+    rm -rf "${NVM_DIR}"
+  fi
+}
+
+: nvm.sh
+\. ../../../nvm.sh
+
+\. ../../common.sh
+
+NODE_A='v22.14.0'
+NODE_B='v20.11.0'
+NPM_PIN='11.10.0'
+
+make_fake_node "${NODE_A}" || die 'failed to make node A'
+make_fake_node "${NODE_B}" || die 'failed to make node B'
+
+write_npm() {
+  cat > "$1" <<EOF
+#!/bin/sh
+if [ "\$1" = "--version" ]; then
+  echo '${2}'
+  exit 0
+fi
+if [ "\$1" = "install" ]; then
+  echo shipped > "\${NPM_CONFIG_PREFIX:-/nonexistent}/from-shipped"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "$1"
+}
+
+write_npx() {
+  cat > "$1" <<EOF
+#!/bin/sh
+echo '${2}'
+EOF
+  chmod +x "$1"
+}
+
+NODE_A_DIR="$(nvm_version_path "${NODE_A}")"
+NODE_B_DIR="$(nvm_version_path "${NODE_B}")"
+NPM_DIR="${NVM_DIR}/versions/npm/${NPM_PIN}"
+
+write_npm "${NODE_A_DIR}/bin/npm" '10.9.2'
+write_npx "${NODE_A_DIR}/bin/npx" 'shipped-npx'
+write_npm "${NODE_B_DIR}/bin/npm" '10.8.2'
+write_npx "${NODE_B_DIR}/bin/npx" 'shipped-b-npx'
+
+seed_overlay() {
+  local RANGE
+  RANGE="${1-}"
+  mkdir -p "${NPM_DIR}/bin" "${NPM_DIR}/lib/node_modules/npm"
+  cat > "${NPM_DIR}/lib/node_modules/npm/package.json" <<EOF
+{ "engines": { "node": "${RANGE}" } }
+EOF
+  cat > "${NPM_DIR}/bin/npm" <<'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '11.10.0'
+  exit 0
+fi
+if [ "$1" = "install" ]; then
+  mkdir -p "${NPM_CONFIG_PREFIX}/marker"
+  echo overlay > "${NPM_CONFIG_PREFIX}/marker/landed"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "${NPM_DIR}/bin/npm"
+  write_npx "${NPM_DIR}/bin/npx" 'pinned-npx'
+}
+
+seed_overlay '>=1.0.0'
+
+# No pin: the npm that shipped with the tarball stays on PATH.
+printf '22.14.0\n' > .nvmrc
+nvm deactivate >/dev/null 2>&1 || true
+unset NPM_CONFIG_PREFIX
+nvm use >/dev/null || die 'nvm use without a pin failed'
+[ "$(command -v npm)" = "${NODE_A_DIR}/bin/npm" ] || die "no pin: npm should be the shipped one, got $(command -v npm)"
+[ -z "${NPM_CONFIG_PREFIX-}" ] || die "no pin: NPM_CONFIG_PREFIX should be unset, got '${NPM_CONFIG_PREFIX}'"
+
+# Pin: prepend the shared npm and point globals at that directory.
+printf '22.14.0\nnpm=11.10.0\n' > .nvmrc
+nvm use >/dev/null || die 'nvm use with a pin failed'
+[ "$(command -v npm)" = "${NPM_DIR}/bin/npm" ] || die "pin: npm should be the overlay, got $(command -v npm)"
+[ "$(command -v npx)" = "${NPM_DIR}/bin/npx" ] || die "pin: npx should be the overlay, got $(command -v npx)"
+[ "$(npm --version)" = '11.10.0' ] || die "pin: expected npm 11.10.0, got $(npm --version)"
+[ "$(npx)" = 'pinned-npx' ] || die "pin: npx did not shadow the node bin"
+[ "${NPM_CONFIG_PREFIX}" = "${NPM_DIR}" ] || die "pin: prefix should be the overlay, got '${NPM_CONFIG_PREFIX-}'"
+[ "$(nvm current)" = "${NODE_A}" ] || die "pin: nvm current should stay ${NODE_A}, got $(nvm current)"
+
+# `nvm install` activates with an explicit version. The pin still applies when
+# that version is the one .nvmrc names.
+nvm deactivate >/dev/null 2>&1 || true
+nvm use "${NODE_A}" >/dev/null || die 'explicit use of the pinned node failed'
+[ "$(command -v npm)" = "${NPM_DIR}/bin/npm" ] || die "explicit nvm use should keep the .nvmrc pin, got $(command -v npm)"
+[ "${NPM_CONFIG_PREFIX}" = "${NPM_DIR}" ] || die 'explicit nvm use should keep the prefix'
+
+# `nvm use --save` rewrites the node line and must keep the pin.
+nvm use --save >/dev/null || die 'nvm use --save failed'
+case "$(cat .nvmrc)" in
+  *'npm=11.10.0'*) ;;
+  *) die "--save dropped the npm pin: $(cat .nvmrc)" ;;
+esac
+
+# A global install lands in the overlay, not the node tarball.
+npm install -g left-pad >/dev/null || die 'global install failed'
+[ -f "${NPM_DIR}/marker/landed" ] || die 'global install did not land in the overlay'
+[ ! -e "${NODE_A_DIR}/marker/landed" ] || die 'global install landed in the node tarball'
+
+# The npm tree is not a node version.
+mkdir -p "${NVM_DIR}/versions/npm/9.9.9"
+LIST="$(nvm ls)"
+case "${LIST}" in
+  *9.9.9*) die "nvm ls listed an npm directory: ${LIST}" ;;
+esac
+case "${LIST}" in
+  *"${NODE_A}"*) ;;
+  *) die "nvm ls did not list ${NODE_A}: ${LIST}" ;;
+esac
+
+# Switching to a node the .nvmrc does not pin drops the overlay.
+nvm use "${NODE_B}" >/dev/null || die 'switch away failed'
+[ "$(command -v npm)" = "${NODE_B_DIR}/bin/npm" ] || die "switch away: expected shipped npm, got $(command -v npm)"
+[ -z "${NPM_CONFIG_PREFIX-}" ] || die "switch away: prefix should be unset, got '${NPM_CONFIG_PREFIX}'"
+[ -x "${NPM_DIR}/bin/npm" ] || die 'switch away removed the shared npm install'
+
+# Deactivate drops the prefix and the overlay bin.
+printf '22.14.0\nnpm=11.10.0\n' > .nvmrc
+nvm use >/dev/null || die 're-pin before deactivate failed'
+nvm deactivate >/dev/null || die 'deactivate failed'
+[ -z "${NPM_CONFIG_PREFIX-}" ] || die "deactivate: prefix should be unset, got '${NPM_CONFIG_PREFIX}'"
+case ":${PATH}:" in
+  *":${NPM_DIR}/bin:"*) die 'deactivate left the npm bin on PATH' ;;
+esac
+
+# An npm whose engines exclude this node is refused, and the shell is unchanged.
+nvm deactivate >/dev/null 2>&1 || true
+unset NPM_CONFIG_PREFIX
+seed_overlay '>=99.0.0'
+if nvm use >/dev/null 2>&1; then
+  die 'engines mismatch should fail nvm use'
+fi
+[ -z "${NPM_CONFIG_PREFIX-}" ] || die 'engines mismatch set a prefix'
+case ":${PATH}:" in
+  *":${NPM_DIR}/bin:"*) die 'engines mismatch put the npm bin on PATH' ;;
+esac
+case ":${PATH}:" in
+  *":${NODE_A_DIR}/bin:"*) die 'engines mismatch still switched node' ;;
+esac
+
+# A refused pin is not a version to record. --save must leave .nvmrc alone.
+printf '22.14.0\nnpm=11\n' > .nvmrc
+if nvm use --save >/dev/null 2>&1; then
+  die 'engines mismatch --save should fail'
+fi
+case "$(cat .nvmrc)" in
+  '22.14.0
+npm=11') ;;
+  *) die "--save rewrote .nvmrc despite engines mismatch: $(cat .nvmrc)" ;;
+esac
+if nvm install --offline --save >/dev/null 2>&1; then
+  die 'engines mismatch install --save should fail'
+fi
+case "$(cat .nvmrc)" in
+  '22.14.0
+npm=11') ;;
+  *) die "install --save rewrote .nvmrc despite engines mismatch: $(cat .nvmrc)" ;;
+esac
+
+# Partial specs follow Node: the highest installed match, without asking the registry.
+seed_overlay '>=1.0.0'
+NPM_11_2="${NVM_DIR}/versions/npm/11.2.0"
+mkdir -p "${NPM_11_2}/bin" "${NPM_11_2}/lib/node_modules/npm"
+printf '%s\n' '{ "engines": { "node": ">=1.0.0" } }' > "${NPM_11_2}/lib/node_modules/npm/package.json"
+cat > "${NPM_11_2}/bin/npm" <<'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '11.2.0'
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "${NPM_11_2}/bin/npm"
+write_npx "${NPM_11_2}/bin/npx" 'npx-11.2.0'
+
+# Shipped npm must not be consulted when an installed copy matches.
+cat > "${NODE_A_DIR}/bin/npm" <<'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '10.9.2'
+  exit 0
+fi
+echo 'shipped npm should not resolve an installed pin' >&2
+exit 1
+EOF
+chmod +x "${NODE_A_DIR}/bin/npm"
+
+printf '22.14.0\nnpm=11\n' > .nvmrc
+nvm use >/dev/null || die 'npm=11 should select the highest installed 11'
+[ "$(command -v npm)" = "${NPM_DIR}/bin/npm" ] || die "npm=11: expected 11.10.0, got $(command -v npm)"
+[ "${NPM_CONFIG_PREFIX}" = "${NPM_DIR}" ] || die "npm=11: prefix should be 11.10.0, got '${NPM_CONFIG_PREFIX-}'"
+
+printf '22.14.0\nnpm=11.2\n' > .nvmrc
+nvm use >/dev/null || die 'npm=11.2 should select 11.2.0'
+[ "$(npm --version)" = '11.2.0' ] || die "npm=11.2: expected 11.2.0, got $(npm --version)"
+[ "${NPM_CONFIG_PREFIX}" = "${NPM_11_2}" ] || die "npm=11.2: prefix got '${NPM_CONFIG_PREFIX-}'"
+
+printf '22.14.0\nnpm=v11\n' > .nvmrc
+nvm use >/dev/null || die 'npm=v11 should select the highest installed 11'
+[ "$(npm --version)" = '11.10.0' ] || die "npm=v11: expected 11.10.0, got $(npm --version)"
+
+# 11.1 must not match 11.10. With no registry answer the switch is refused.
+printf '22.14.0\nnpm=11.1\n' > .nvmrc
+if nvm use >/dev/null 2>&1; then
+  die 'npm=11.1 should not match 11.10'
+fi
+[ "$(npm --version)" = '11.10.0' ] || die 'failed 11.1 resolve should leave the previous npm'
+
+# --save freezes the npm pin to the exact version just activated, as it does for Node.
+printf '22.14.0\nnpm=11\n' > .nvmrc
+nvm use --save >/dev/null || die 'npm=11 --save failed'
+SAVED_PIN="$(nvm_nvmrc_npm_version "$(cat .nvmrc)")" || die '--save dropped the npm pin'
+[ "${SAVED_PIN}" = '11.10.0' ] || die "--save should record 11.10.0, got '${SAVED_PIN}'"
+
+# Missing overlay: nvm use installs it with the shipped npm, once.
+rm -rf "${NPM_DIR}"
+printf '22.14.0\nnpm=11.10.0\n' > .nvmrc
+cat > "${NODE_A_DIR}/bin/npm" <<'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '10.9.2'
+  exit 0
+fi
+if [ "$1" = "view" ]; then
+  echo '>=1.0.0'
+  exit 0
+fi
+if [ "$1" = "install" ]; then
+  prefix=''
+  prev=''
+  for arg in "$@"; do
+    if [ "${prev}" = "--prefix" ]; then
+      prefix="${arg}"
+    fi
+    prev="${arg}"
+  done
+  mkdir -p "${prefix}/bin" "${prefix}/lib/node_modules/npm"
+  printf '%s\n' '{ "engines": { "node": ">=1.0.0" } }' > "${prefix}/lib/node_modules/npm/package.json"
+  cat > "${prefix}/bin/npm" <<'INNER'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '11.10.0'
+  exit 0
+fi
+exit 0
+INNER
+  chmod +x "${prefix}/bin/npm"
+  echo pinned-npx > "${prefix}/bin/npx"
+  chmod +x "${prefix}/bin/npx"
+  echo "${prefix}" > "${prefix}/installed-prefix"
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "${NODE_A_DIR}/bin/npm"
+nvm use >/dev/null || die 'nvm use should install a missing pinned npm'
+[ -x "${NPM_DIR}/bin/npm" ] || die 'pinned npm was not installed'
+[ "$(command -v npm)" = "${NPM_DIR}/bin/npm" ] || die "after install, npm should be the overlay, got $(command -v npm)"
+# A second use must not need the shipped installer to succeed.
+cat > "${NODE_A_DIR}/bin/npm" <<'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '10.9.2'
+  exit 0
+fi
+echo 'shipped npm should not install again' >&2
+exit 1
+EOF
+chmod +x "${NODE_A_DIR}/bin/npm"
+nvm use >/dev/null || die 'second nvm use should reuse the installed npm'
+
+# Incompatible engines are refused before the shipped npm installs anything.
+rm -rf "${NPM_DIR}"
+cat > "${NODE_A_DIR}/bin/npm" <<'EOF'
+#!/bin/sh
+if [ "$1" = "view" ]; then
+  echo '>=99.0.0'
+  exit 0
+fi
+if [ "$1" = "install" ]; then
+  echo install-ran > "${TMPDIR:-/tmp}/nvm-npm-install-ran"
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  echo '10.9.2'
+  exit 0
+fi
+exit 0
+EOF
+chmod +x "${NODE_A_DIR}/bin/npm"
+rm -f "${TMPDIR:-/tmp}/nvm-npm-install-ran"
+if nvm use >/dev/null 2>&1; then
+  die 'incompatible npm should be refused before use'
+fi
+[ ! -e "${TMPDIR:-/tmp}/nvm-npm-install-ran" ] || die 'incompatible npm was installed anyway'
+[ ! -d "${NPM_DIR}" ] || die 'incompatible npm left an overlay directory'
+
+# Nothing installed for this major: ask the shipped npm, then install that exact version.
+rm -rf "${NVM_DIR}/versions/npm"
+printf '22.14.0\nnpm=11\n' > .nvmrc
+cat > "${NODE_A_DIR}/bin/npm" <<'EOF'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '10.9.2'
+  exit 0
+fi
+if [ "$1" = "view" ] && [ "$3" = "version" ]; then
+  echo '11.6.0'
+  exit 0
+fi
+if [ "$1" = "view" ] && [ "$3" = "engines.node" ]; then
+  echo '>=1.0.0'
+  exit 0
+fi
+if [ "$1" = "install" ]; then
+  prefix=''
+  prev=''
+  for arg in "$@"; do
+    if [ "${prev}" = "--prefix" ]; then
+      prefix="${arg}"
+    fi
+    prev="${arg}"
+  done
+  mkdir -p "${prefix}/bin" "${prefix}/lib/node_modules/npm"
+  printf '%s\n' '{ "engines": { "node": ">=1.0.0" } }' > "${prefix}/lib/node_modules/npm/package.json"
+  cat > "${prefix}/bin/npm" <<'INNER'
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '11.6.0'
+  exit 0
+fi
+exit 0
+INNER
+  chmod +x "${prefix}/bin/npm"
+  echo pinned-npx > "${prefix}/bin/npx"
+  chmod +x "${prefix}/bin/npx"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "${NODE_A_DIR}/bin/npm"
+nvm deactivate >/dev/null 2>&1 || true
+unset NPM_CONFIG_PREFIX
+nvm use >/dev/null || die 'npm=11 with nothing installed should resolve and install'
+NPM_11_6="${NVM_DIR}/versions/npm/11.6.0"
+[ -x "${NPM_11_6}/bin/npm" ] || die 'resolved npm was not installed at 11.6.0'
+[ ! -d "${NVM_DIR}/versions/npm/11" ] || die 'partial spec was used as a directory name'
+[ "$(command -v npm)" = "${NPM_11_6}/bin/npm" ] || die "resolved pin: expected 11.6.0, got $(command -v npm)"
+[ "$(npm --version)" = '11.6.0' ] || die "resolved pin: expected version 11.6.0, got $(npm --version)"
+# A later use resolves the installed copy and must not ask the registry again.
+cat > "${NODE_A_DIR}/bin/npm" <<'EOF'
+#!/bin/sh
+echo 'shipped npm should not resolve again' >&2
+exit 1
+EOF
+chmod +x "${NODE_A_DIR}/bin/npm"
+nvm use >/dev/null || die 'second nvm use should reuse the resolved npm'
+
+# Uninstalling the node keeps the shared npm tree.
+seed_overlay '>=1.0.0'
+echo keep > "${NPM_DIR}/keep"
+nvm deactivate >/dev/null 2>&1 || true
+nvm uninstall "${NODE_A}" >/dev/null || die 'uninstall failed'
+[ ! -d "${NODE_A_DIR}" ] || die 'node directory should have been removed'
+[ -f "${NPM_DIR}/keep" ] || die 'uninstall removed the shared npm tree'
+
+cleanup

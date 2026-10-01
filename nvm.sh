@@ -284,6 +284,15 @@ nvm_print_npm_version() {
 }
 
 nvm_install_latest_npm() {
+  # The prefix is the shared pin. `npm install -g` would rewrite that copy
+  # for every Node version that uses it. The pin is changed in .nvmrc.
+  case "${NPM_CONFIG_PREFIX-}" in
+    "${NVM_DIR}/versions/npm/"*)
+      nvm_err 'A pinned npm is active. Refusing to upgrade it. Change the npm= line in .nvmrc.'
+      return 1
+    ;;
+  esac
+
   nvm_echo 'Attempting to upgrade to the latest working version of npm...'
   local NODE_VERSION
   NODE_VERSION="$(nvm_strip_iojs_prefix "$(nvm_ls_current)")"
@@ -717,6 +726,453 @@ nvm_process_nvmrc() {
   NVMRC_PATH="$1"
 
   nvm_process_nvmrc_content "$(command cat "${NVMRC_PATH}")"
+}
+
+# Same shapes as a Node version (`11`, `11.10`, `11.10.0`, optional `v`),
+# via nvm_is_valid_version. Implicit aliases and io.js are Node-only.
+nvm_npm_version_spec_is_valid() {
+  local SPEC
+  SPEC="${1-}"
+  if nvm_validate_implicit_alias "${SPEC}" >/dev/null 2>&1; then
+    return 1
+  fi
+  if nvm_is_iojs_version "${SPEC}"; then
+    return 1
+  fi
+  nvm_is_valid_version "${SPEC}"
+}
+
+nvm_nvmrc_npm_version() {
+  local CONTENT
+  CONTENT="${1-}"
+  local lines
+  lines="$(nvm_echo "${CONTENT}" | command sed 's/#.*//' | command sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | nvm_grep -v '^$' || true)"
+
+  local line
+  local key
+  local value
+  local found
+  found=''
+  while IFS= read -r line; do
+    case "${line}" in
+      *'='*)
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="$(nvm_echo "${key}" | command sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        value="$(nvm_echo "${value}" | command sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        if [ "${key}" = 'npm' ]; then
+          if [ -n "${found}" ]; then
+            nvm_err '.nvmrc has more than one npm pin'
+            return 1
+          fi
+          found="${value}"
+        fi
+      ;;
+    esac
+  done <<EOF
+${lines}
+EOF
+
+  if [ -z "${found}" ]; then
+    return 0
+  fi
+  if ! nvm_npm_version_spec_is_valid "${found}"; then
+    nvm_err ".nvmrc npm pin must be a version such as 11, 11.10, or 11.10.0; got '${found}'"
+    return 1
+  fi
+  nvm_echo "${found}"
+}
+
+nvm_semver_part() {
+  local V
+  V="${1#v}"
+  V="${V%%-*}"
+  local N
+  N="${2-}"
+  local REST
+  REST="${V}"
+  while [ "${N}" -gt 1 ]; do
+    case "${REST}" in
+      *.*) REST="${REST#*.}" ;;
+      *) REST='' ;;
+    esac
+    N=$((N - 1))
+  done
+  local PART
+  PART="${REST%%.*}"
+  case "${PART}" in
+    '' | *[!0-9]*) nvm_echo 0 ;;
+    *) nvm_echo "${PART}" ;;
+  esac
+}
+
+# ponytail: ^, >=, and || only — the forms npm puts in engines.node.
+# Other comparators (~, hyphen ranges, prereleases) count as unsatisfied.
+nvm_npm_one_comparator() {
+  local NODE
+  NODE="${1-}"
+  local COMP
+  COMP="${2-}"
+  local VER
+  case "${COMP}" in
+    '' | '*' | 'x' | 'X')
+      return 0
+    ;;
+    '>='*)
+      VER="${COMP#>=}"
+      VER="${VER#v}"
+      nvm_version_greater_than_or_equal_to "${NODE}" "${VER}"
+    ;;
+    '^'*)
+      VER="${COMP#^}"
+      VER="${VER#v}"
+      local MAJOR
+      MAJOR="$(nvm_semver_part "${VER}" 1)"
+      local MINOR
+      MINOR="$(nvm_semver_part "${VER}" 2)"
+      local PATCH
+      PATCH="$(nvm_semver_part "${VER}" 3)"
+      if [ "${MAJOR}" -gt 0 ]; then
+        [ "$(nvm_semver_part "${NODE}" 1)" -eq "${MAJOR}" ] || return 1
+        nvm_version_greater_than_or_equal_to "${NODE}" "${MAJOR}.${MINOR}.${PATCH}"
+      elif [ "${MINOR}" -gt 0 ]; then
+        [ "$(nvm_semver_part "${NODE}" 1)" -eq 0 ] || return 1
+        [ "$(nvm_semver_part "${NODE}" 2)" -eq "${MINOR}" ] || return 1
+        nvm_version_greater_than_or_equal_to "${NODE}" "0.${MINOR}.${PATCH}"
+      else
+        [ "$(nvm_semver_part "${NODE}" 1)" -eq 0 ] || return 1
+        [ "$(nvm_semver_part "${NODE}" 2)" -eq 0 ] || return 1
+        [ "$(nvm_semver_part "${NODE}" 3)" -eq "${PATCH}" ]
+      fi
+    ;;
+    *)
+      return 1
+    ;;
+  esac
+}
+
+nvm_npm_engines_clause_satisfied() {
+  local NODE
+  NODE="${1-}"
+  local REST
+  REST="${2-}"
+  local COMP
+  while [ -n "${REST}" ]; do
+    case "${REST}" in
+      ' '*) REST="${REST# }" ; continue ;;
+    esac
+    COMP="${REST%% *}"
+    if [ "${COMP}" = "${REST}" ]; then
+      REST=''
+    else
+      REST="${REST#* }"
+    fi
+    nvm_npm_one_comparator "${NODE}" "${COMP}" || return 1
+  done
+  return 0
+}
+
+nvm_npm_engines_satisfied() {
+  local NODE
+  NODE="${1#v}"
+  local RANGE
+  RANGE="$(nvm_echo "${2-}" | command sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [ -z "${RANGE}" ] || [ "${RANGE}" = '*' ] || [ "${RANGE}" = 'x' ]; then
+    return 0
+  fi
+  local REST
+  REST="${RANGE}"
+  local CLAUSE
+  local TRIMMED
+  while [ -n "${REST}" ]; do
+    case "${REST}" in
+      *'||'*)
+        CLAUSE="${REST%%||*}"
+        REST="${REST#*||}"
+      ;;
+      *)
+        CLAUSE="${REST}"
+        REST=''
+      ;;
+    esac
+    TRIMMED="$(nvm_echo "${CLAUSE}" | command sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -n "${TRIMMED}" ] && nvm_npm_engines_clause_satisfied "${NODE}" "${TRIMMED}"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+nvm_npm_engines_from_package() {
+  local PKG
+  PKG="${1-}"
+  if [ ! -f "${PKG}" ]; then
+    return 1
+  fi
+  local RANGE
+  RANGE="$(command awk '
+    /"engines"/ { engines = 1 }
+    engines && /"node"/ {
+      line = $0
+      sub(/.*"node"[[:space:]]*:[[:space:]]*"/, "", line)
+      sub(/".*/, "", line)
+      print line
+      exit
+    }
+  ' "${PKG}")"
+  if [ -z "${RANGE}" ]; then
+    return 1
+  fi
+  nvm_echo "${RANGE}"
+}
+
+nvm_npm_version_dir() {
+  local VERSION
+  VERSION="${1-}"
+  nvm_echo "${NVM_DIR}/versions/npm/${VERSION}"
+}
+
+# Best installed npm matching SPEC, using the same major/minor/patch rules as
+# nvm_ls: one or two numeric groups are a prefix (`11` matches 11.x, `11.1`
+# does not match 11.10), three or more is that exact version. An exact spec
+# is returned even when it is not installed yet.
+nvm_resolve_installed_npm_version() {
+  local SPEC
+  SPEC="${1-}"
+  if ! nvm_npm_version_spec_is_valid "${SPEC}"; then
+    return 1
+  fi
+  local PREFIXED
+  PREFIXED="$(nvm_ensure_version_prefix "${SPEC}")"
+  local NVM_GROUPS
+  NVM_GROUPS="$(nvm_num_version_groups "${PREFIXED}")"
+  if [ "${NVM_GROUPS}" -ge 3 ]; then
+    nvm_echo "${PREFIXED#v}"
+    return 0
+  fi
+  if [ "${NVM_GROUPS}" -ne 1 ] && [ "${NVM_GROUPS}" -ne 2 ]; then
+    return 1
+  fi
+  local PATTERN
+  PATTERN="${PREFIXED%.}."
+  local DIR
+  DIR="${NVM_DIR}/versions/npm"
+  if [ ! -d "${DIR}" ]; then
+    return 1
+  fi
+  nvm_is_zsh && setopt local_options nonomatch
+  local NAME
+  local BASE
+  local VBASE
+  local MATCHES
+  MATCHES=''
+  for NAME in "${DIR}"/*; do
+    if [ ! -d "${NAME}" ]; then
+      continue
+    fi
+    BASE="${NAME##*/}"
+    if ! nvm_npm_version_spec_is_valid "${BASE}"; then
+      continue
+    fi
+    VBASE="$(nvm_ensure_version_prefix "${BASE}")"
+    case "${VBASE}" in
+      "${PATTERN}"*) MATCHES="${MATCHES}
+${VBASE}" ;;
+    esac
+  done
+  if [ -z "${MATCHES}" ]; then
+    return 1
+  fi
+  local BEST
+  BEST="$(nvm_echo "${MATCHES}" | command sort -t. -u -k 1.2,1n -k 2,2n -k 3,3n | command tail -n 1)"
+  if [ -z "${BEST}" ]; then
+    return 1
+  fi
+  nvm_echo "${BEST#v}"
+}
+
+# No installed copy matched a partial spec. Ask the shipped npm for one exact
+# version (`npm view npm@11 version`) and return that, without a leading v.
+nvm_remote_npm_version() {
+  local SPEC
+  SPEC="${1-}"
+  local NODE_DIR
+  NODE_DIR="${2-}"
+  if ! nvm_npm_version_spec_is_valid "${SPEC}"; then
+    return 1
+  fi
+  local QUERY
+  QUERY="$(nvm_ensure_version_prefix "${SPEC}")"
+  QUERY="${QUERY#v}"
+  local SHIPPED
+  SHIPPED="${NODE_DIR}/bin/npm"
+  if [ ! -x "${SHIPPED}" ]; then
+    nvm_err "Cannot resolve npm@${QUERY}; ${NODE_DIR}/bin/npm is missing."
+    return 1
+  fi
+  local RAW
+  RAW="$(
+    unset NPM_CONFIG_PREFIX
+    unset npm_config_prefix
+    unset PREFIX
+    "${SHIPPED}" view "npm@${QUERY}" version 2>/dev/null
+  )" || {
+    nvm_err "Could not resolve npm@${QUERY}"
+    return 1
+  }
+  local LINE
+  LINE="$(nvm_echo "${RAW}" | command tail -n 1 | command sed 's/^["'\'']//;s/["'\'']$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if ! nvm_npm_version_spec_is_valid "${LINE}"; then
+    nvm_err "npm@${QUERY} did not resolve to a version (got '${LINE}')"
+    return 1
+  fi
+  local PREFIXED
+  PREFIXED="$(nvm_ensure_version_prefix "${LINE}")"
+  local NVM_GROUPS
+  NVM_GROUPS="$(nvm_num_version_groups "${PREFIXED}")"
+  if [ "${NVM_GROUPS}" -lt 3 ]; then
+    nvm_err "npm@${QUERY} did not resolve to an exact version (got '${LINE}')"
+    return 1
+  fi
+  nvm_echo "${PREFIXED#v}"
+}
+
+# The pin applies when the node being activated is the one .nvmrc names.
+# `nvm install` reaches `nvm use` with an explicit version, so this is not
+# limited to `nvm use` with no arguments.
+nvm_pinned_npm_for_node() {
+  local VERSION
+  VERSION="${1-}"
+  local NVMRC_PATH
+  NVMRC_PATH="$(nvm_find_nvmrc)"
+  if [ ! -e "${NVMRC_PATH}" ]; then
+    return 0
+  fi
+  local CONTENT
+  CONTENT="$(command cat "${NVMRC_PATH}")"
+  local RC_NODE
+  RC_NODE="$(nvm_process_nvmrc_content "${CONTENT}" 2>/dev/null)" || return 0
+  local RESOLVED
+  RESOLVED="$(nvm_version "${RC_NODE}")" || return 0
+  if [ "${RESOLVED}" != "${VERSION}" ]; then
+    return 0
+  fi
+  local RAW
+  RAW="$(nvm_nvmrc_npm_version "${CONTENT}")" || return 1
+  if [ -z "${RAW}" ]; then
+    return 0
+  fi
+  # Same rule as `nvm use 24`: an installed match wins, including a partial
+  # one. An exact spec is itself even when that copy is not installed yet.
+  local INSTALLED
+  if INSTALLED="$(nvm_resolve_installed_npm_version "${RAW}")"; then
+    nvm_echo "${INSTALLED}"
+    return 0
+  fi
+  nvm_remote_npm_version "${RAW}" "$(nvm_version_path "${VERSION}")"
+}
+
+nvm_strip_npm_path() {
+  local RESULT
+  RESULT="$(command printf %s "${1-}" | command awk -v PREFIX="${NVM_DIR}/versions/npm/" -v RS=: '
+    index($0, PREFIX) == 1 { next }
+    { printf "%s%s", sep, $0; sep = RS }
+  ')"
+  case "${1-}" in
+    *:) command printf '%s:' "${RESULT}" ;;
+    *) command printf '%s' "${RESULT}" ;;
+  esac
+}
+
+nvm_clear_pinned_npm_prefix() {
+  local VALUE
+  VALUE="${NPM_CONFIG_PREFIX-}"
+  case "${VALUE}" in
+    "${NVM_DIR}/versions/npm/"*) unset NPM_CONFIG_PREFIX ;;
+  esac
+}
+
+nvm_install_pinned_npm() {
+  local NPM_VERSION
+  NPM_VERSION="${1-}"
+  local NODE_DIR
+  NODE_DIR="${2-}"
+  local NODE_VERSION
+  NODE_VERSION="${3-}"
+  local DEST
+  DEST="$(nvm_npm_version_dir "${NPM_VERSION}")"
+  if [ -x "${DEST}/bin/npm" ] && [ -f "${DEST}/lib/node_modules/npm/package.json" ]; then
+    return 0
+  fi
+  local SHIPPED
+  SHIPPED="${NODE_DIR}/bin/npm"
+  if [ ! -x "${SHIPPED}" ]; then
+    nvm_err "Cannot install npm@${NPM_VERSION}; ${NODE_DIR}/bin/npm is missing."
+    return 1
+  fi
+
+  # Ask the shipped npm before writing anything. A pin that cannot run on
+  # this node is refused here, and the shared directory is left untouched.
+  local RANGE
+  RANGE="$(
+    unset NPM_CONFIG_PREFIX
+    unset npm_config_prefix
+    unset PREFIX
+    "${SHIPPED}" view "npm@${NPM_VERSION}" engines.node 2>/dev/null
+  )" || RANGE=''
+  RANGE="$(nvm_echo "${RANGE}" | command head -n 1 | command sed 's/^["'\'']//;s/["'\'']$//;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [ -n "${RANGE}" ] && [ "${RANGE}" != 'undefined' ] && [ "${RANGE}" != 'null' ]; then
+    if ! nvm_npm_engines_satisfied "${NODE_VERSION}" "${RANGE}"; then
+      nvm_err "npm@${NPM_VERSION} does not support node ${NODE_VERSION} (requires ${RANGE})"
+      return 1
+    fi
+  fi
+
+  if ! nvm_acquire_install_lock "npm-${NPM_VERSION}"; then
+    return 1
+  fi
+  if [ -x "${DEST}/bin/npm" ] && [ -f "${DEST}/lib/node_modules/npm/package.json" ]; then
+    nvm_release_install_lock
+    return 0
+  fi
+  command rm -rf "${DEST}"
+  command mkdir -p "${DEST}" || {
+    nvm_release_install_lock
+    return 1
+  }
+  if ! (
+    unset NPM_CONFIG_PREFIX
+    unset npm_config_prefix
+    unset PREFIX
+    "${SHIPPED}" install --global --prefix "${DEST}" --no-audit --no-fund "npm@${NPM_VERSION}"
+  ) || [ ! -x "${DEST}/bin/npm" ]; then
+    nvm_release_install_lock
+    command rm -rf "${DEST}"
+    nvm_err "Failed to install npm@${NPM_VERSION}"
+    return 1
+  fi
+  nvm_release_install_lock
+}
+
+nvm_check_pinned_npm_engines() {
+  local NPM_VERSION
+  NPM_VERSION="${1-}"
+  local NODE_VERSION
+  NODE_VERSION="${2-}"
+  local PKG
+  PKG="$(nvm_npm_version_dir "${NPM_VERSION}")/lib/node_modules/npm/package.json"
+  if [ ! -f "${PKG}" ]; then
+    nvm_err "npm@${NPM_VERSION} is missing its package.json"
+    return 1
+  fi
+  local RANGE
+  if RANGE="$(nvm_npm_engines_from_package "${PKG}")"; then
+    if ! nvm_npm_engines_satisfied "${NODE_VERSION}" "${RANGE}"; then
+      nvm_err "npm@${NPM_VERSION} does not support node ${NODE_VERSION} (requires ${RANGE})"
+      return 1
+    fi
+  fi
+  return 0
 }
 
 nvm_rc_version() {
@@ -3485,7 +3941,23 @@ nvm_write_nvmrc() {
   if [ "${VERSION_STRING}" = '∞' ] || [ "${VERSION_STRING}" = 'N/A' ]; then
     return 1
   fi
-  echo "${VERSION_STRING}" | tee "$PWD"/.nvmrc > /dev/null || {
+  local NVM_RC_BODY
+  NVM_RC_BODY="${VERSION_STRING}"
+  if [ -f .nvmrc ]; then
+    local NVM_NPM_PIN
+    NVM_NPM_PIN="$(nvm_nvmrc_npm_version "$(command cat .nvmrc)" 2>/dev/null)" || NVM_NPM_PIN=''
+    if [ -n "${NVM_NPM_PIN}" ]; then
+      # Same as the node line: record the version this command resolved,
+      # not the partial spec. Nothing installed means there is nothing to freeze.
+      local NVM_NPM_RESOLVED
+      if NVM_NPM_RESOLVED="$(nvm_resolve_installed_npm_version "${NVM_NPM_PIN}")"; then
+        NVM_NPM_PIN="${NVM_NPM_RESOLVED}"
+      fi
+      NVM_RC_BODY="${VERSION_STRING}
+npm=${NVM_NPM_PIN}"
+    fi
+  fi
+  echo "${NVM_RC_BODY}" | tee "$PWD"/.nvmrc > /dev/null || {
     if [ "${NVM_SILENT:-0}" -ne 1 ]; then
       nvm_err "Warning: Unable to write version number ($VERSION_STRING) to .nvmrc"
     fi
@@ -3746,6 +4218,7 @@ nvm() {
         nvm_echo '    --lts                                     Uses automatic LTS (long-term support) alias `lts/*`, if available.'
         nvm_echo '    --lts=<LTS name>                          Uses automatic alias for provided LTS line, if available.'
         nvm_echo '    --save                                    Writes the specified version to .nvmrc.'
+        nvm_echo '  An .nvmrc may contain npm=<version> (11, 11.10, or 11.10.0). nvm use then prepends that shared npm and sets NPM_CONFIG_PREFIX.'
         nvm_echo '  nvm exec [current | <version>] [<command>]  Run <command> on <version>. Uses .nvmrc if version is omitted; otherwise errors.'
         nvm_echo '   The following optional arguments, if provided, must appear directly after `nvm exec`:'
         nvm_echo '    --silent                                  Silences stdout/stderr output'
@@ -4233,6 +4706,8 @@ nvm() {
         nvm_err "${VERSION} is already installed."
         nvm use "${VERSION}"
         EXIT_CODE=$?
+        local NVM_USE_EXIT_CODE
+        NVM_USE_EXIT_CODE="${EXIT_CODE}"
         if [ $EXIT_CODE -eq 0 ]; then
           if [ "${NVM_UPGRADE_NPM}" = 1 ]; then
             nvm install-latest-npm
@@ -4254,7 +4729,7 @@ nvm() {
           nvm_ensure_default_set "${provided_version}"
         fi
 
-        if [ $NVM_WRITE_TO_NVMRC -eq 1 ]; then
+        if [ $NVM_WRITE_TO_NVMRC -eq 1 ] && [ "${NVM_USE_EXIT_CODE}" -eq 0 ]; then
           nvm_write_nvmrc "${VERSION}"
           EXIT_CODE=$?
         fi
@@ -4509,6 +4984,7 @@ nvm() {
       fi
       unset NVM_BIN
       unset NVM_INC
+      nvm_clear_pinned_npm_prefix
     ;;
     "use")
       local PROVIDED_VERSION
@@ -4572,11 +5048,12 @@ nvm() {
         return 127
       fi
 
-      if [ $NVM_WRITE_TO_NVMRC -eq 1 ]; then
-        nvm_write_nvmrc "${VERSION}"
-      fi
-
       if [ "_${VERSION}" = '_system' ]; then
+        # `system` returns before the npm pin is considered. Save here so
+        # `nvm use system --save` still records it.
+        if [ $NVM_WRITE_TO_NVMRC -eq 1 ]; then
+          nvm_write_nvmrc "${VERSION}"
+        fi
         if nvm_has_system_node && nvm deactivate "${NVM_SILENT_ARG-}" >/dev/null 2>&1; then
           if [ "${NVM_SILENT:-0}" -ne 1 ]; then
             nvm_echo "Now using system version of node: $(node -v 2>/dev/null)$(nvm_print_npm_version)"
@@ -4611,7 +5088,28 @@ nvm() {
       local NVM_VERSION_DIR
       NVM_VERSION_DIR="$(nvm_version_path "${VERSION}")"
 
-      # Change current version
+      local NVM_NPM_PIN
+      if ! NVM_NPM_PIN="$(nvm_pinned_npm_for_node "${VERSION}")"; then
+        return 1
+      fi
+      if [ -n "${NVM_NPM_PIN}" ]; then
+        if ! nvm_install_pinned_npm "${NVM_NPM_PIN}" "${NVM_VERSION_DIR}" "${VERSION}"; then
+          return 1
+        fi
+        if ! nvm_check_pinned_npm_engines "${NVM_NPM_PIN}" "${VERSION}"; then
+          return 1
+        fi
+      fi
+
+      # Save only once the pin has been accepted. A refused engines range
+      # must not rewrite .nvmrc to the version that was just rejected.
+      if [ $NVM_WRITE_TO_NVMRC -eq 1 ]; then
+        nvm_write_nvmrc "${VERSION}"
+      fi
+
+      # Change current version. Drop any previous npm overlay first so
+      # nvm_change_path does not rewrite it into a second node bin.
+      PATH="$(nvm_strip_npm_path "${PATH}")"
       PATH="$(nvm_change_path "${PATH}" "/bin" "${NVM_VERSION_DIR}")"
       if nvm_has manpath; then
         MANPATH="$(nvm_change_path "${MANPATH-}" "/share/man" "${NVM_VERSION_DIR}")"
@@ -4625,6 +5123,17 @@ nvm() {
       fi
       export PATH
       nvm_hash_reset
+      if [ -n "${NVM_NPM_PIN}" ]; then
+        local NVM_NPM_DIR
+        NVM_NPM_DIR="$(nvm_npm_version_dir "${NVM_NPM_PIN}")"
+        PATH="${NVM_NPM_DIR}/bin:${PATH}"
+        export PATH
+        NPM_CONFIG_PREFIX="${NVM_NPM_DIR}"
+        export NPM_CONFIG_PREFIX
+        nvm_hash_reset
+      else
+        nvm_clear_pinned_npm_prefix
+      fi
       export NVM_BIN="${NVM_VERSION_DIR}/bin"
       export NVM_INC="${NVM_VERSION_DIR}/include/node"
       if [ "${NVM_SYMLINK_CURRENT-}" = true ]; then
@@ -5239,6 +5748,14 @@ nvm() {
         nvm_echo_with_colors nvm_err_with_colors \
         nvm_get_artifact_compression nvm_install_binary_extract nvm_extract_tarball \
         nvm_process_nvmrc nvm_process_nvmrc_content nvm_nvmrc_invalid_msg \
+        nvm_npm_version_spec_is_valid nvm_nvmrc_npm_version \
+        nvm_resolve_installed_npm_version nvm_remote_npm_version \
+        nvm_semver_part nvm_npm_one_comparator \
+        nvm_npm_engines_clause_satisfied nvm_npm_engines_satisfied \
+        nvm_npm_engines_from_package nvm_npm_version_dir \
+        nvm_pinned_npm_for_node nvm_strip_npm_path \
+        nvm_clear_pinned_npm_prefix nvm_install_pinned_npm \
+        nvm_check_pinned_npm_engines \
         nvm_write_nvmrc nvm_hash_reset \
         >/dev/null 2>&1
       unset NVM_NODEJS_ORG_MIRROR NVM_IOJS_ORG_MIRROR NVM_DIR \

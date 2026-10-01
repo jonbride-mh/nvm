@@ -1,0 +1,57 @@
+#!/bin/sh
+
+die () { echo "$@" ; exit 1; }
+
+: nvm.sh
+\. ../../../nvm.sh
+
+# npm 11's range: early Node 22 is out, Node 22.9 and Node 20.17 are in.
+nvm_npm_engines_satisfied 'v22.14.0' '^20.17.0 || >=22.9.0' \
+  || die 'v22.14.0 should satisfy npm 11 engines'
+nvm_npm_engines_satisfied 'v20.17.0' '^20.17.0 || >=22.9.0' \
+  || die 'v20.17.0 should satisfy npm 11 engines'
+nvm_npm_engines_satisfied 'v22.9.0' '^20.17.0 || >=22.9.0' \
+  || die 'v22.9.0 should satisfy npm 11 engines'
+
+if nvm_npm_engines_satisfied 'v22.8.0' '^20.17.0 || >=22.9.0'; then
+  die 'v22.8.0 should not satisfy npm 11 engines'
+fi
+if nvm_npm_engines_satisfied 'v21.0.0' '^20.17.0 || >=22.9.0'; then
+  die 'v21.0.0 should not satisfy a ^20 or >=22.9 range'
+fi
+if nvm_npm_engines_satisfied 'v20.16.9' '^20.17.0 || >=22.9.0'; then
+  die 'v20.16.9 should not satisfy ^20.17.0'
+fi
+
+# 0.x caret ranges stay inside the minor.
+nvm_npm_engines_satisfied '0.2.9' '^0.2.3' \
+  || die '0.2.9 should satisfy ^0.2.3'
+if nvm_npm_engines_satisfied '0.3.0' '^0.2.3'; then
+  die '0.3.0 should not satisfy ^0.2.3'
+fi
+nvm_npm_engines_satisfied '0.0.5' '^0.0.5' \
+  || die '0.0.5 should satisfy ^0.0.5'
+if nvm_npm_engines_satisfied '0.0.6' '^0.0.5'; then
+  die '0.0.6 should not satisfy ^0.0.5'
+fi
+
+# No constraint means any node.
+nvm_npm_engines_satisfied 'v1.0.0' '' \
+  || die 'an empty range should allow any node'
+nvm_npm_engines_satisfied 'v1.0.0' '*' \
+  || die 'a star range should allow any node'
+
+# The range npm publishes lives in the installed package.json.
+TMP="${PWD}/nvm_npm_engines_tmp"
+rm -rf "${TMP}"
+mkdir -p "${TMP}"
+cat > "${TMP}/package.json" <<'EOF'
+{
+  "engines": {
+    "node": "^20.17.0 || >=22.9.0"
+  }
+}
+EOF
+RANGE="$(nvm_npm_engines_from_package "${TMP}/package.json")" || die 'failed to read engines.node'
+[ "${RANGE}" = '^20.17.0 || >=22.9.0' ] || die "expected engines range, got '${RANGE}'"
+rm -rf "${TMP}"
